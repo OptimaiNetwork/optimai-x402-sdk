@@ -5,6 +5,7 @@ import type {
   CreateSearchRequest,
   CreateSearchResult,
   ExternalSearchResponse,
+  SearchAccessResult,
   SearchAccessOptions,
   SearchPaymentContext,
   WaitForSearchCompletionOptions,
@@ -98,8 +99,23 @@ function getPaymentSignatureFromHeaders(headers: HeadersInit): string | undefine
   return paymentSignature ?? undefined;
 }
 
-function isTerminalStatus(status: ExternalSearchResponse["status"]): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+function isTerminalStatus(search: ExternalSearchResponse): boolean {
+  if (search.status === "failed" || search.status === "cancelled") {
+    return true;
+  }
+
+  if (search.status !== "completed") {
+    return false;
+  }
+
+  if (search.result) {
+    return true;
+  }
+
+  // Settlement recovery can briefly expose a completed job without its result.
+  // Keep polling while the verified payment is still unsettled.
+  return search.x402_payment_status !== "verified_unsettled"
+    && search.x402_payment_status !== "settlement_unconfirmed";
 }
 
 async function parseResponseBody(response: Response): Promise<unknown> {
@@ -202,26 +218,29 @@ export class OptimaiX402Client {
     }
 
     let search: ExternalSearchResponse;
+    let paymentContext: SearchPaymentContext;
     if (paidResponse.status === 303) {
       const id = this.extractSearchIdFromRedirect(paidBody);
       const existingPaymentContext =
         options.existingPaymentContext
         ?? (options.idempotencyKey ? this.paymentContextsByIdempotencyKey.get(options.idempotencyKey) : undefined);
+      paymentContext = existingPaymentContext
+        ? { ...existingPaymentContext, id }
+        : { id, paymentRequired, paymentSignature };
       search = await this.getSearch(id, {
-        paymentContext: existingPaymentContext
-          ? { ...existingPaymentContext, id }
-          : { id, paymentRequired, paymentSignature },
+        paymentContext,
         ...(options.signal ? { signal: options.signal } : {}),
       });
     } else {
       search = paidBody as ExternalSearchResponse;
+      paymentContext = {
+        id: search.id,
+        paymentRequired,
+        paymentSignature,
+      };
     }
 
-    const paymentContext: SearchPaymentContext = {
-      id: search.id,
-      paymentRequired,
-      paymentSignature,
-    };
+    paymentContext.id = search.id;
     this.rememberPaymentContext(paymentContext);
     if (options.idempotencyKey) {
       this.paymentContextsByIdempotencyKey.set(options.idempotencyKey, paymentContext);
@@ -237,7 +256,7 @@ export class OptimaiX402Client {
     searchId: string,
     options: SearchAccessOptions = {},
   ): Promise<ExternalSearchResponse> {
-    return this.requestWithStoredContext<ExternalSearchResponse>(
+    const response = await this.requestWithStoredContext<ExternalSearchResponse>(
       `/external/v1/x402/search/${searchId}`,
       withOptionalSignal({
         method: "GET",
@@ -245,13 +264,39 @@ export class OptimaiX402Client {
       searchId,
       options.paymentContext,
     );
+    return response.body;
+  }
+
+  async getSearchWithPaymentContext(
+    searchId: string,
+    options: SearchAccessOptions = {},
+  ): Promise<SearchAccessResult> {
+    const response = await this.requestWithStoredContext<ExternalSearchResponse>(
+      `/external/v1/x402/search/${searchId}`,
+      withOptionalSignal({
+        method: "GET",
+      }, options.signal),
+      searchId,
+      options.paymentContext,
+    );
+    return {
+      search: response.body,
+      paymentContext: response.paymentContext,
+    };
+  }
+
+  async getSearchResult(
+    searchId: string,
+    options: SearchAccessOptions = {},
+  ): Promise<SearchAccessResult> {
+    return this.getSearchWithPaymentContext(searchId, options);
   }
 
   async cancelSearch(
     searchId: string,
     options: SearchAccessOptions = {},
   ): Promise<CancelSearchResponse> {
-    return this.requestWithStoredContext<CancelSearchResponse>(
+    const response = await this.requestWithStoredContext<CancelSearchResponse>(
       `/external/v1/x402/search/${searchId}`,
       withOptionalSignal({
         method: "DELETE",
@@ -259,20 +304,29 @@ export class OptimaiX402Client {
       searchId,
       options.paymentContext,
     );
+    return response.body;
   }
 
   async waitForSearchCompletion(
     searchId: string,
     options: WaitForSearchCompletionOptions = {},
   ): Promise<ExternalSearchResponse> {
+    const response = await this.waitForSearchCompletionWithPaymentContext(searchId, options);
+    return response.search;
+  }
+
+  async waitForSearchCompletionWithPaymentContext(
+    searchId: string,
+    options: WaitForSearchCompletionOptions = {},
+  ): Promise<SearchAccessResult> {
     const intervalMs = options.intervalMs ?? 2_000;
     const timeoutMs = options.timeoutMs ?? 300_000;
     const startedAt = Date.now();
 
     while (true) {
-      const search = await this.getSearch(searchId, options);
-      if (isTerminalStatus(search.status)) {
-        return search;
+      const response = await this.getSearchWithPaymentContext(searchId, options);
+      if (isTerminalStatus(response.search)) {
+        return response;
       }
 
       if (Date.now() - startedAt > timeoutMs) {
@@ -288,7 +342,7 @@ export class OptimaiX402Client {
     init: RequestInit,
     searchId: string,
     providedContext?: SearchPaymentContext,
-  ): Promise<T> {
+  ): Promise<{ body: T; paymentContext: SearchPaymentContext }> {
     const paymentContext = providedContext ?? this.paymentContexts.get(searchId);
     if (!paymentContext) {
       throw new OptimaiX402Error(
@@ -300,16 +354,59 @@ export class OptimaiX402Client {
     const paymentHeaders = paymentContext.paymentSignature
       ? { "payment-signature": paymentContext.paymentSignature }
       : await this.config.paymentHandler.createPaymentHeaders(paymentContext.paymentRequired);
+    const generatedPaymentSignature = getPaymentSignatureFromHeaders(paymentHeaders);
+    if (!generatedPaymentSignature) {
+      throw new OptimaiX402Error("Payment handler did not return a payment-signature header.");
+    }
+    if (!paymentContext.paymentSignature) {
+      paymentContext.paymentSignature = generatedPaymentSignature;
+      this.rememberPaymentContext(paymentContext);
+    }
+
     const response = await this.fetchImpl(
       `${this.baseUrl}${normalizePath(path)}`,
       cloneInitWithHeaders(init, mergeHeaders(init.headers, paymentHeaders)),
     );
     const body = await parseResponseBody(response);
+
+    const challengeHeader = response.status === 402
+      ? response.headers.get("payment-required") ?? response.headers.get("x-payment-required")
+      : undefined;
+    if (init.method?.toUpperCase() === "GET" && challengeHeader) {
+      const resultPaymentRequired = decodePaymentRequiredHeader(challengeHeader);
+      const resultPaymentHeaders = await this.config.paymentHandler.createPaymentHeaders(resultPaymentRequired);
+      const resultPaymentSignature = getPaymentSignatureFromHeaders(resultPaymentHeaders);
+      if (!resultPaymentSignature) {
+        throw new OptimaiX402Error("Payment handler did not return a payment-signature header.");
+      }
+
+      paymentContext.paymentRequired = resultPaymentRequired;
+      paymentContext.paymentSignature = resultPaymentSignature;
+      this.rememberPaymentContext(paymentContext);
+
+      const retriedResponse = await this.fetchImpl(
+        `${this.baseUrl}${normalizePath(path)}`,
+        cloneInitWithHeaders(init, mergeHeaders(init.headers, resultPaymentHeaders)),
+      );
+      const retriedBody = await parseResponseBody(retriedResponse);
+      if (!retriedResponse.ok) {
+        throw toApiError(retriedResponse.status, retriedBody);
+      }
+
+      return {
+        body: retriedBody as T,
+        paymentContext,
+      };
+    }
+
     if (!response.ok) {
       throw toApiError(response.status, body);
     }
 
-    return body as T;
+    return {
+      body: body as T,
+      paymentContext,
+    };
   }
 
   private extractSearchIdFromRedirect(body: unknown): string {

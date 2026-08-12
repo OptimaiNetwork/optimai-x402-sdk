@@ -1,5 +1,9 @@
 import { ExactEvmScheme, toClientEvmSigner, type ClientEvmSigner } from "@x402/evm";
 import { type PaymentRequired, x402Client, x402HTTPClient } from "@x402/fetch";
+import { ExactSvmScheme } from "@x402/svm/exact/client";
+import { createKeyPairSignerFromBytes } from "@solana/kit";
+import { Keypair } from "@solana/web3.js";
+import { base58 } from "@scure/base";
 import { createPublicClient, http, type Chain } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base, baseSepolia } from "viem/chains";
@@ -16,6 +20,12 @@ export interface ViemPaymentHandlerConfig {
   chains?: Record<string, Chain>;
 }
 
+export interface SolanaPaymentHandlerConfig {
+  privateKey?: string | Uint8Array;
+  keypair?: Keypair;
+  rpcUrls?: Record<string, string>;
+}
+
 interface PaymentClientBundle {
   client: ReturnType<typeof x402Client.fromConfig>;
   httpClient: x402HTTPClient;
@@ -24,6 +34,13 @@ interface PaymentClientBundle {
 const DEFAULT_CHAINS: Record<string, Chain> = {
   "eip155:8453": base,
   "eip155:84532": baseSepolia,
+};
+
+const SOLANA_MAINNET_CAIP2 = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+const SOLANA_DEVNET_CAIP2 = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+const DEFAULT_SOLANA_RPC_URLS: Record<string, string> = {
+  [SOLANA_MAINNET_CAIP2]: "https://api.mainnet-beta.solana.com",
+  [SOLANA_DEVNET_CAIP2]: "https://api.devnet.solana.com",
 };
 
 function normalizePrivateKey(privateKey: string): `0x${string}` {
@@ -43,6 +60,24 @@ function normalizeHeaders(headers: Record<string, string>): Record<string, strin
     normalized[key.toLowerCase()] = value;
   }
   return normalized;
+}
+
+export function clonePaymentRequiredWithAccept(
+  paymentRequired: X402PaymentRequired,
+  networkPrefix: string,
+  isSupported: (requirement: X402PaymentRequired["accepts"][number]) => boolean = () => true,
+): X402PaymentRequired {
+  const accepted = paymentRequired.accepts.find((requirement) =>
+    requirement.network.startsWith(networkPrefix) && isSupported(requirement),
+  );
+  if (!accepted) {
+    throw new OptimaiX402Error(`x402 payment challenge does not include a supported ${networkPrefix} network.`);
+  }
+
+  return {
+    ...paymentRequired,
+    accepts: [accepted],
+  };
 }
 
 function resolveChain(network: string, config: ViemPaymentHandlerConfig): Chain {
@@ -71,6 +106,19 @@ function resolveRpcUrl(network: string, chain: Chain, config: ViemPaymentHandler
   }
 
   throw new OptimaiX402Error(`Missing RPC URL for x402 network: ${network}`);
+}
+
+function canUseViemPaymentRequirement(
+  requirement: X402PaymentRequired["accepts"][number],
+  config: ViemPaymentHandlerConfig,
+): boolean {
+  try {
+    const chain = resolveChain(requirement.network, config);
+    resolveRpcUrl(requirement.network, chain, config);
+    return true;
+  } catch (_error) {
+    return false;
+  }
 }
 
 function createPaymentClientBundle(
@@ -121,10 +169,12 @@ export function createViemPaymentHandler(config: ViemPaymentHandlerConfig): Paym
 
   return {
     async createPaymentHeaders(paymentRequired: X402PaymentRequired): Promise<Record<string, string>> {
-      const network = paymentRequired.accepts[0]?.network;
-      if (!network) {
-        throw new OptimaiX402Error("x402 payment challenge does not include a supported network.");
-      }
+      const selectedPaymentRequired = clonePaymentRequiredWithAccept(
+        paymentRequired,
+        "eip155:",
+        (requirement) => canUseViemPaymentRequirement(requirement, config),
+      );
+      const network = selectedPaymentRequired.accepts[0]!.network;
 
       let bundle = bundles.get(network);
       if (!bundle) {
@@ -132,7 +182,88 @@ export function createViemPaymentHandler(config: ViemPaymentHandlerConfig): Paym
         bundles.set(network, bundle);
       }
 
-      const paymentPayload = await bundle.client.createPaymentPayload(paymentRequired as PaymentRequired);
+      const paymentPayload = await bundle.client.createPaymentPayload(selectedPaymentRequired as PaymentRequired);
+      return normalizeHeaders(bundle.httpClient.encodePaymentSignatureHeader(paymentPayload));
+    },
+  };
+}
+
+function normalizeSolanaPrivateKey(value: string | Uint8Array): Uint8Array {
+  if (value instanceof Uint8Array) {
+    if (value.length !== 64) {
+      throw new OptimaiX402Error("Invalid Solana private key. Expected a 64-byte secret key.");
+    }
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new OptimaiX402Error("Invalid Solana private key. Expected a base58 or JSON-encoded 64-byte secret key.");
+  }
+
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (
+        Array.isArray(parsed) &&
+        parsed.length === 64 &&
+        parsed.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)
+      ) {
+        return Uint8Array.from(parsed as number[]);
+      }
+    } catch (_error) {
+      // Fall through to base58 parsing for a consistent user-facing error.
+    }
+  }
+
+  try {
+    const decoded = base58.decode(trimmed);
+    if (decoded.length !== 64) {
+      throw new Error("invalid length");
+    }
+    return decoded;
+  } catch (_error) {
+    throw new OptimaiX402Error("Invalid Solana private key. Expected a base58 or JSON-encoded 64-byte secret key.");
+  }
+}
+
+function resolveSolanaRpcUrl(network: string, config: SolanaPaymentHandlerConfig): string | undefined {
+  return config.rpcUrls?.[network] ?? DEFAULT_SOLANA_RPC_URLS[network];
+}
+
+export async function createSolanaPaymentHandler(config: SolanaPaymentHandlerConfig): Promise<PaymentHandler> {
+  const secretKey = config.keypair?.secretKey ?? (config.privateKey ? normalizeSolanaPrivateKey(config.privateKey) : null);
+  if (!secretKey) {
+    throw new OptimaiX402Error("Solana payment handler requires privateKey or keypair.");
+  }
+
+  const signer = await createKeyPairSignerFromBytes(secretKey);
+  const bundles = new Map<string, PaymentClientBundle>();
+
+  return {
+    async createPaymentHeaders(paymentRequired: X402PaymentRequired): Promise<Record<string, string>> {
+      const selectedPaymentRequired = clonePaymentRequiredWithAccept(paymentRequired, "solana:");
+      const network = selectedPaymentRequired.accepts[0]!.network;
+
+      let bundle = bundles.get(network);
+      if (!bundle) {
+        const rpcUrl = resolveSolanaRpcUrl(network, config);
+        const client = x402Client.fromConfig({
+          schemes: [
+            {
+              network: "solana:*",
+              client: new ExactSvmScheme(signer, rpcUrl ? { rpcUrl } : undefined),
+            },
+          ],
+        });
+        bundle = {
+          client,
+          httpClient: new x402HTTPClient(client),
+        };
+        bundles.set(network, bundle);
+      }
+
+      const paymentPayload = await bundle.client.createPaymentPayload(selectedPaymentRequired as PaymentRequired);
       return normalizeHeaders(bundle.httpClient.encodePaymentSignatureHeader(paymentPayload));
     },
   };

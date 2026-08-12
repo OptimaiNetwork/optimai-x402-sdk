@@ -5,7 +5,8 @@ import {
 
 const BASE_URL = process.env.OPTIMAI_X402_BASE_URL ?? "https://api-onchain.optimai.network";
 const QUERY = process.env.OPTIMAI_X402_QUERY ?? "What is BNB?";
-const PRIVATE_KEY = process.env.X402_PAYER_PRIVATE_KEY;
+const PRIVATE_KEY = process.env.X402_EVM_PAYER_PRIVATE_KEY
+  ?? process.env.X402_PAYER_PRIVATE_KEY;
 const IDEMPOTENCY_KEY = process.env.OPTIMAI_X402_IDEMPOTENCY_KEY
   ?? `sdk-smoke-${Date.now()}`;
 const TIMEOUT_MS = Number(process.env.OPTIMAI_X402_TIMEOUT_MS ?? "300000");
@@ -21,12 +22,15 @@ function requireEnv(name, value) {
 
 function getRpcUrls() {
   const rpcUrls = {
-    "eip155:8453": process.env.X402_RPC_URL_BASE
+    "eip155:8453": process.env.X402_EVM_BASE_RPC_URL
+      ?? process.env.X402_RPC_URL_BASE
       ?? process.env.X402_RPC_URL
       ?? "https://mainnet.base.org",
   };
 
-  if (process.env.X402_RPC_URL_BASE_SEPOLIA) {
+  if (process.env.X402_EVM_BASE_SEPOLIA_RPC_URL) {
+    rpcUrls["eip155:84532"] = process.env.X402_EVM_BASE_SEPOLIA_RPC_URL;
+  } else if (process.env.X402_RPC_URL_BASE_SEPOLIA) {
     rpcUrls["eip155:84532"] = process.env.X402_RPC_URL_BASE_SEPOLIA;
   } else if (process.env.X402_RPC_URL) {
     rpcUrls["eip155:84532"] = process.env.X402_RPC_URL;
@@ -43,7 +47,7 @@ function logStep(title, details) {
 }
 
 async function main() {
-  requireEnv("X402_PAYER_PRIVATE_KEY", PRIVATE_KEY);
+  requireEnv("X402_EVM_PAYER_PRIVATE_KEY or X402_PAYER_PRIVATE_KEY", PRIVATE_KEY);
 
   const paymentHandler = createViemPaymentHandler({
     privateKey: PRIVATE_KEY,

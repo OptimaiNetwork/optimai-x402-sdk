@@ -43,8 +43,10 @@ export type ExternalSearchStatus =
   | "cancelled";
 
 export type X402PaymentStatus =
-  // Payment is verified, but settlement is not finalized in OptimAI yet.
+  // Canonical server status: payment is verified, but settlement is not finalized in OptimAI yet.
   // On-chain transfer may already exist while the server is still confirming/persisting settlement id.
+  | "verified_unsettled"
+  // Legacy name retained for compatibility with older server responses and SDK callers.
   | "settlement_unconfirmed"
   // Settlement is finalized and the server has persisted settlement id (transaction hash).
   | "settled"
@@ -110,6 +112,11 @@ export interface SearchPaymentContext {
 }
 
 export interface CreateSearchResult {
+  search: ExternalSearchResponse;
+  paymentContext: SearchPaymentContext;
+}
+
+export interface SearchAccessResult {
   search: ExternalSearchResponse;
   paymentContext: SearchPaymentContext;
 }
