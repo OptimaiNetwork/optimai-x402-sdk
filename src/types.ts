@@ -24,6 +24,7 @@ export interface X402PaymentRequired {
 
 export interface CreateSearchRequest {
   query: string;
+  search_mode?: "search" | "agent";
   callback_url?: string;
   metadata?: Record<string, unknown>;
   options?: {

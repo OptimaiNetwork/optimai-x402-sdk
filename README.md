@@ -86,6 +86,28 @@ const completed = await client.waitForSearchCompletion(search.id, {
 console.log(completed.result?.answer);
 ```
 
+## Search modes
+
+Search creation defaults to the standard Search mode. Pass `search_mode: "agent"`
+to request the explicit, text-only Agent mode:
+
+```ts
+const { search, paymentContext } = await client.createSearch({
+  query: "Compare the latest battery storage options",
+  search_mode: "agent",
+});
+
+const completed = await client.waitForSearchCompletion(search.id, {
+  paymentContext,
+});
+```
+
+Agent mode uses its own server payment challenge and costs exactly twice the
+configured Search offer. The SDK takes the amount, asset, receiver, network, and
+other payment requirements from that challenge; do not set them in the request.
+The SDK supports x402 payments for the Search endpoint only and does not expose
+internal planning fields.
+
 ## Payment requirements and `payTo`
 
 SDK users do not manually set `payTo`, amount, asset, network, or Solana `feePayer`.

@@ -129,6 +129,53 @@ test("createSearch stores the original payment signature and replays it on follo
   assert.deepEqual(seenSignatures, [paidSignature, paidSignature]);
 });
 
+test("createSearch serializes the public agent mode without planner fields", async () => {
+  const paymentRequired = createPaymentRequired("eip155:8453", "0xagent-payto");
+  paymentRequired.accepts[0].amount = "20000";
+  const encodedChallenge = encodePaymentRequired(paymentRequired);
+  let requestCount = 0;
+
+  const client = createOptimaiX402Client({
+    baseUrl: "https://example.com",
+    paymentHandler: {
+      async createPaymentHeaders(challenge) {
+        assert.deepEqual(challenge, paymentRequired);
+        assert.equal(challenge.accepts[0].amount, "20000");
+        return { "payment-signature": "agent-signature" };
+      },
+    },
+    fetch: async (_url, init) => {
+      requestCount += 1;
+      assert.equal(init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(init?.body)), {
+        query: "Plan a text-only research task",
+        search_mode: "agent",
+      });
+
+      if (requestCount === 1) {
+        return new Response("{}", {
+          status: 402,
+          headers: { "payment-required": encodedChallenge },
+        });
+      }
+
+      return createJsonResponse({
+        id: "search-agent-mode",
+        status: "pending",
+        query: "Plan a text-only research task",
+      }, { status: 202 });
+    },
+  });
+
+  const result = await client.createSearch({
+    query: "Plan a text-only research task",
+    search_mode: "agent",
+  });
+
+  assert.equal(result.search.id, "search-agent-mode");
+  assert.equal(requestCount, 2);
+});
+
 test("createSearch reuses the original stored context for idempotent 303 retries in the same process", async () => {
   const originalPaymentRequired = {
     x402Version: 2,
